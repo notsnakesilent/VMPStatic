@@ -3,6 +3,8 @@ A static VMProtect decompressor for PE files, compatible with VMProtect 1.x–3.
 
 Unlike dynamic decompressors, this tool works without executing the target file. The goal is to recover a usable PE image that can be further analyzed in tools such as IDA, Ghidra, x64dbg, or similar software.
 
+<img width="1113" height="626" alt="image" src="https://github.com/user-attachments/assets/8fea91d2-7340-4973-8a11-d635fc37ef59" />
+
 ## Features
 
 - Static VMProtect unpacking  
