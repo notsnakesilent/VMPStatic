@@ -8,7 +8,7 @@ Unlike dynamic unpacker, this tool works without executing the target file. The 
 ## Features
 
 - Static VMProtect unpacking  
-- Compatible with VMProtect 1.x, 2.x, and 3.x patterns  
+- Compatible with VMProtect 1.x, 2.x, and 3.x patterns (Until 3.10.5, VMP stopped using LZMA as compression algorithm)
 - Analysis of PE headers and sections  
 - Detection of VMProtect sections and stubs  
 - Reconstruction of packed images  
