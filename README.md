@@ -8,7 +8,7 @@ Unlike dynamic unpacker, this tool works without executing the target file. The 
 ## Features
 
 - Static VMProtect unpacking  
-- Compatible with VMProtect 1.x, 2.x, and 3.x patterns (Until 3.10.x, need an update)
+- Compatible with VMProtect 1.x, 2.x, and 3.x patterns (Until >3.9.x, need an update)
 - Analysis of PE headers and sections  
 - Detection of VMProtect sections and stubs  
 - Reconstruction of packed images  
