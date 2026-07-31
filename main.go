@@ -20,6 +20,7 @@ const (
 
 	sectionCntUninitData = 0x00000080
 	sectionMemExecute    = 0x20000000
+	sectionMemRead       = 0x40000000
 
 	dirImport    = 1
 	dirResource  = 2
@@ -27,7 +28,16 @@ const (
 	dirCLR       = 14
 
 	lzmaPropsSize = 5
+
+	// How much of a block to decode when confirming a candidate PACKER_INFO.
+	lzmaProbeSize = 512
 )
+
+// From 3.10 on the LZMA properties are no longer stored in the image; the loader
+// carries the stock lc=3 lp=0 pb=2 settings. The dictionary size only bounds match
+// distances, so it has to be generous: 1MB already fails on VMProtect's own
+// runtime block, 64MB covers every sample.
+var defaultLZMAProps = []byte{0x5D, 0x00, 0x00, 0x00, 0x04}
 
 type SectionInfo struct {
 	Name             string
@@ -322,6 +332,10 @@ func detectVMProtect(data []byte) VMPResult {
 	}
 
 	if !result.Detected {
+		result = detectVMP310(pe)
+	}
+
+	if !result.Detected {
 		result = detectByDeepScan(pe)
 	}
 
@@ -446,6 +460,46 @@ func detectBySectionCharacteristics(pe *PEFile) VMPResult {
 	}
 
 	return VMPResult{}
+}
+
+// detectVMP310 recognises 3.10+ output. That version randomises every section
+// name on each build, so ".vmp0", the name-collision trick and the entry point
+// signatures all miss. The stub's shape still gives it away: it owns the entry
+// point, it is executable, and the originals it swallowed are left in front of
+// it as virtual-only sections.
+func detectVMP310(pe *PEFile) VMPResult {
+	epIdx := pe.getEntryPointSection()
+	if epIdx < 1 {
+		return VMPResult{}
+	}
+
+	stub := pe.sections[epIdx]
+	const execRead = sectionMemExecute | sectionMemRead
+	if stub.Characteristics&execRead != execRead || stub.SizeOfRawData == 0 {
+		return VMPResult{}
+	}
+
+	packed := 0
+	for i := 0; i < epIdx; i++ {
+		s := pe.sections[i]
+		if s.SizeOfRawData == 0 && s.PointerToRawData == 0 &&
+			s.Characteristics&sectionCntUninitData == 0 {
+			packed++
+		}
+	}
+	if packed < 3 {
+		return VMPResult{}
+	}
+
+	end := stub.PointerToRawData + stub.SizeOfRawData
+	if int(end) > len(pe.data) {
+		return VMPResult{}
+	}
+	if calculateEntropy(pe.data[stub.PointerToRawData:end]) < 7.0 {
+		return VMPResult{}
+	}
+
+	return VMPResult{Detected: true, Version: "3.10+"}
 }
 
 func detectByEntryPoint(pe *PEFile) VMPResult {
@@ -884,6 +938,170 @@ func decompressLZMA(props, compressed []byte) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
+// packedSections lists the sections whose contents the packer moved into LZMA
+// blocks: they keep their headers but carry no raw data. Uninitialised sections
+// are skipped, since there was never anything to compress.
+func packedSections(pe *PEFile) []SectionInfo {
+	var out []SectionInfo
+	for _, s := range pe.sections {
+		isVirtualOnly := s.SizeOfRawData == 0 && s.PointerToRawData == 0
+		isNotUninit := s.Characteristics&sectionCntUninitData == 0
+		if isVirtualOnly && isNotUninit {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func sectionNameAt(pe *PEFile, rva uint32) string {
+	for _, s := range pe.sections {
+		if rva >= s.VirtualAddress && rva < s.VirtualAddress+s.VirtualSize {
+			return s.Name
+		}
+	}
+	return "?"
+}
+
+// findPackerInfoLegacy matches the older table of 8-byte {Src,Dst} entries by
+// anchoring on the destination RVAs, which are just the packed sections'
+// addresses. PACKER_INFO[0] is not a block: it points at the 5 LZMA property
+// bytes. Returns the offset of the first block entry.
+func findPackerInfoLegacy(pe *PEFile, dests []SectionInfo) (int, []byte, bool) {
+	var rvaPattern []byte
+	for _, s := range dests {
+		rvaPattern = append(rvaPattern, 0xFF, 0xFF, 0xFF, 0xFF)
+		vaBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(vaBytes, s.VirtualAddress)
+		rvaPattern = append(rvaPattern, vaBytes...)
+	}
+
+	matchIdx := findPattern(pe.data, rvaPattern)
+	if matchIdx < 8 {
+		return 0, nil, false
+	}
+
+	propsRVA := binary.LittleEndian.Uint32(pe.data[matchIdx-8:])
+	propsRawOff, err := rvaToRawOffset(pe, propsRVA)
+	if err != nil || int(propsRawOff)+lzmaPropsSize > len(pe.data) {
+		return 0, nil, false
+	}
+	return matchIdx, pe.data[propsRawOff : propsRawOff+lzmaPropsSize], true
+}
+
+func rol32(v uint32, n uint) uint32 {
+	n &= 31
+	return v<<n | v>>(32-n)
+}
+
+// findPackerInfoV39 locates the encrypted table used from 3.9 on. Entries are
+// still 8 bytes, but the destination is stored as Dst^key, where the loader
+// rotates key left by 7 bits before each entry. That leaves no plaintext RVAs for
+// a byte pattern to anchor on.
+//
+// The destinations are still just the packed sections' addresses, which is enough
+// to both find the table and recover the key: seed key from entry 0 against each
+// candidate section, then require every remaining entry to decrypt to a distinct
+// one. Over len(dests) entries that is a permutation check, and it only survives
+// on the real table.
+func findPackerInfoV39(pe *PEFile, dests []SectionInfo) (int, []PackerInfo, bool) {
+	data := pe.data
+	n := len(dests)
+
+	// A single entry carries too little structure to tell a real table from a
+	// stray pointer. Real output always has the stub's own runtime block too.
+	if n < 2 {
+		return 0, nil, false
+	}
+
+	isDest := make(map[uint32]bool, n)
+	for _, s := range dests {
+		isDest[s.VirtualAddress] = true
+	}
+
+	blockOffset := func(entryOff int) (uint32, bool) {
+		if entryOff+8 > len(data) {
+			return 0, false
+		}
+		raw, err := rvaToRawOffset(pe, binary.LittleEndian.Uint32(data[entryOff:]))
+		if err != nil {
+			return 0, false
+		}
+		// A raw LZMA stream opens with the range coder's init byte, always zero.
+		if data[raw] != 0 {
+			return 0, false
+		}
+		return raw, true
+	}
+
+	for i := 0; i+8*n <= len(data); i++ {
+		plausible := true
+		for k := 0; k < n && plausible; k++ {
+			_, plausible = blockOffset(i + k*8)
+		}
+		if !plausible {
+			continue
+		}
+
+		stored := binary.LittleEndian.Uint32(data[i+4:])
+		for _, seed := range dests {
+			key := stored ^ seed.VirtualAddress
+
+			entries := make([]PackerInfo, 0, n)
+			seen := make(map[uint32]bool, n)
+			for k := 0; k < n; k++ {
+				dst := binary.LittleEndian.Uint32(data[i+k*8+4:]) ^ rol32(key, uint(7*k))
+				if !isDest[dst] || seen[dst] {
+					break
+				}
+				seen[dst] = true
+				entries = append(entries, PackerInfo{
+					Src: binary.LittleEndian.Uint32(data[i+k*8:]),
+					Dst: dst,
+				})
+			}
+			if len(entries) != n {
+				continue
+			}
+
+			// Cheap insurance for short tables, where the permutation check alone
+			// leaves some room: confirm every block really decodes.
+			decodes := true
+			for k := 0; k < n && decodes; k++ {
+				raw, _ := blockOffset(i + k*8)
+				decodes = probeLZMA(defaultLZMAProps, data[raw:])
+			}
+			if decodes {
+				return i, entries, true
+			}
+		}
+	}
+
+	return 0, nil, false
+}
+
+// probeLZMA reports whether compressed starts a stream that decodes far enough to
+// be worth trusting. Blocks shorter than the probe size count as a pass.
+func probeLZMA(props, compressed []byte) bool {
+	header := make([]byte, 13)
+	copy(header[:5], props)
+	binary.LittleEndian.PutUint64(header[5:], 0xFFFFFFFFFFFFFFFF)
+
+	r, err := lzma.NewReader(io.MultiReader(
+		bytes.NewReader(header),
+		bytes.NewReader(compressed),
+	))
+	if err != nil {
+		return false
+	}
+
+	n, err := io.ReadFull(r, make([]byte, lzmaProbeSize))
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		// A block shorter than the probe still counts, as long as it ended cleanly.
+		return n > 0
+	}
+	return err == nil
+}
+
 func unpackPE(data []byte) ([]byte, error) {
 	pe, err := parsePE(data)
 	if err != nil {
@@ -922,58 +1140,40 @@ func unpackPE(data []byte) ([]byte, error) {
 		}
 	}
 
-	var rvaPattern []byte
-	for _, s := range pe.sections {
-		isVirtualOnly := s.SizeOfRawData == 0 && s.PointerToRawData == 0
-		isNotUninit := s.Characteristics&sectionCntUninitData == 0
-		if isVirtualOnly && isNotUninit {
-			rvaPattern = append(rvaPattern, 0xFF, 0xFF, 0xFF, 0xFF)
-			vaBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(vaBytes, s.VirtualAddress)
-			rvaPattern = append(rvaPattern, vaBytes...)
-		}
-	}
-
-	if len(rvaPattern) == 0 {
+	dests := packedSections(pe)
+	if len(dests) == 0 {
 		fmt.Println("  No virtual-only sections found; no LZMA blocks to decompress.")
 		return unpacked, nil
 	}
 
-	matchIdx := findPattern(data, rvaPattern)
-	if matchIdx < 0 {
-		return nil, fmt.Errorf("could not locate PACKER_INFO RVA pattern in packed PE")
-	}
-	if matchIdx < 8 {
-		return nil, fmt.Errorf("PACKER_INFO[0] would be before the start of the file")
-	}
+	var entries []PackerInfo
 
-	piBase := matchIdx - 8
-	numBlocks := len(rvaPattern) / 8
-
-	propsInfo := PackerInfo{
-		Src: binary.LittleEndian.Uint32(data[piBase:]),
-		Dst: binary.LittleEndian.Uint32(data[piBase+4:]),
-	}
-	propsRawOff, err := rvaToRawOffset(pe, propsInfo.Src)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve LZMA props RVA 0x%X: %w", propsInfo.Src, err)
-	}
-	if int(propsRawOff)+lzmaPropsSize > len(data) {
-		return nil, fmt.Errorf("LZMA props at 0x%X extend past end of file", propsRawOff)
-	}
-	lzmaProps := data[propsRawOff : propsRawOff+lzmaPropsSize]
-	fmt.Printf("LZMA props: %X (from RVA 0x%X)\n", lzmaProps, propsInfo.Src)
-
-	for i := 1; i <= numBlocks; i++ {
-		entryOff := piBase + i*8
-		if entryOff+8 > len(data) {
-			return nil, fmt.Errorf("PACKER_INFO[%d] is out of file bounds", i)
+	piBase, lzmaProps, legacy := findPackerInfoLegacy(pe, dests)
+	if legacy {
+		for i := range dests {
+			entryOff := piBase + i*8
+			if entryOff+8 > len(data) {
+				return nil, fmt.Errorf("PACKER_INFO[%d] is out of file bounds", i)
+			}
+			entries = append(entries, PackerInfo{
+				Src: binary.LittleEndian.Uint32(data[entryOff:]),
+				Dst: binary.LittleEndian.Uint32(data[entryOff+4:]),
+			})
 		}
-		entry := PackerInfo{
-			Src: binary.LittleEndian.Uint32(data[entryOff:]),
-			Dst: binary.LittleEndian.Uint32(data[entryOff+4:]),
+		fmt.Printf("PACKER_INFO at file offset 0x%X: %d plaintext {Src,Dst} entries, LZMA props %X\n",
+			piBase, len(entries), lzmaProps)
+	} else {
+		var found bool
+		piBase, entries, found = findPackerInfoV39(pe, dests)
+		if !found {
+			return nil, fmt.Errorf("could not locate PACKER_INFO in packed PE")
 		}
+		lzmaProps = defaultLZMAProps
+		fmt.Printf("PACKER_INFO at file offset 0x%X: %d {Src,Dst^key} entries, implicit LZMA props %X (3.9+ layout)\n",
+			piBase, len(entries), lzmaProps)
+	}
 
+	for i, entry := range entries {
 		compRawOff, err := rvaToRawOffset(pe, entry.Src)
 		if err != nil {
 			return nil, fmt.Errorf("block %d: failed to resolve compressed data RVA 0x%X: %w", i, entry.Src, err)
@@ -995,8 +1195,8 @@ func unpackPE(data []byte) ([]byte, error) {
 		}
 		copy(unpacked[dstOff:], decompressed)
 
-		fmt.Printf("  Block %d: SrcRVA=0x%08X DstRVA=0x%08X DecompressedSize=%d\n",
-			i, entry.Src, entry.Dst, len(decompressed))
+		fmt.Printf("  Block %d (%s): SrcRVA=0x%08X DstRVA=0x%08X DecompressedSize=%d\n",
+			i, sectionNameAt(pe, entry.Dst), entry.Src, entry.Dst, len(decompressed))
 	}
 
 	return unpacked, nil
